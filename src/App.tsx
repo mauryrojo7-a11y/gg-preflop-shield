@@ -38,6 +38,14 @@ interface PreflopState {
 
 const RANKS = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'] as const;
 
+// Lista priorizada de modelos rápidos con visión JSON; si dan 404 se auto-descubre desde /v1beta/models
+const CANDIDATE_VISION_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash',
+  'gemini-flash-latest'
+];
+
 const PREFLOP_VISION_PROMPT = `Sos un lector óptico preflop de ultra baja latencia para mesas 8-Max Hyper-Turbo de GGPoker.
 Ignorá cualquier carta comunitaria y extraé EXCLUSIVAMENTE el estado PREFLOP en JSON válido con este esquema exacto:
 {
@@ -55,6 +63,10 @@ Ignorá cualquier carta comunitaria y extraé EXCLUSIVAMENTE el estado PREFLOP e
   "isIcmActive": boolean (true si se observa paño de Final Table o burbuja Hand-for-Hand)
 }`;
 
+function sanitizeApiKey(raw: string): string {
+  return raw.replace(/\s+/g, '').trim();
+}
+
 function normalizeRank(val: string): string {
   const clean = (val || 'A').toUpperCase().trim();
   if (clean === '10') return 'T';
@@ -71,6 +83,54 @@ function formatUsdFromCents(cents: bigint): string {
   const neg = cents < 0n;
   const abs = neg ? -cents : cents;
   return `${neg ? '-' : ''}$${(abs / 100n).toString()}.${(abs % 100n).toString().padStart(2, '0')}`;
+}
+
+function extractFirstJsonObject(raw: string): string {
+  const trimmed = raw.trim();
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fencedMatch ? fencedMatch[1].trim() : trimmed;
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start !== -1 && end !== -1 && end > start) {
+    return candidate.slice(start, end + 1);
+  }
+  return candidate;
+}
+
+async function discoverAvailableFlashModel(cleanKey: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(cleanKey)}`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const models: Array<{ name?: string; supportedGenerationMethods?: string[] }> =
+      data?.models || [];
+
+    const validIds = models
+      .filter(
+        (m) =>
+          typeof m.name === 'string' &&
+          Array.isArray(m.supportedGenerationMethods) &&
+          m.supportedGenerationMethods.includes('generateContent')
+      )
+      .map((m) => (m.name as string).replace(/^models\//, ''));
+
+    // Priorizar cualquier variante Flash con visión (excluyendo modelos solo TTS/embedding/imagen)
+    const flashModel = validIds.find(
+      (id) =>
+        id.includes('flash') &&
+        !id.includes('tts') &&
+        !id.includes('image') &&
+        !id.includes('audio') &&
+        !id.includes('8b')
+    );
+    if (flashModel) return flashModel;
+
+    return validIds.find((id) => id.startsWith('gemini-')) || null;
+  } catch {
+    return null;
+  }
 }
 
 function computePreflopEquityVsVillain(
@@ -254,6 +314,9 @@ function evaluateCellPreflopAction(
 export default function App() {
   const [tab, setTab] = useState<ActiveTab>('scanner');
   const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem('gg_shield_key') || '');
+  const [resolvedModel, setResolvedModel] = useState<string>(
+    () => localStorage.getItem('gg_shield_model') || ''
+  );
   const [showKeyModal, setShowKeyModal] = useState<boolean>(false);
   const [cameraActive, setCameraActive] = useState<boolean>(false);
   const [isScanning, setIsScanning] = useState<boolean>(false);
@@ -284,8 +347,14 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
-    localStorage.setItem('gg_shield_key', apiKey);
+    localStorage.setItem('gg_shield_key', sanitizeApiKey(apiKey));
   }, [apiKey]);
+
+  useEffect(() => {
+    if (resolvedModel) {
+      localStorage.setItem('gg_shield_model', resolvedModel);
+    }
+  }, [resolvedModel]);
 
   useEffect(() => {
     localStorage.setItem('gg_shield_roll_cents', bankrollCentsStr);
@@ -324,13 +393,45 @@ export default function App() {
       setCameraActive(true);
     } catch {
       setErrorMsg(
-        'Para cámara continua usá HTTPS (GitHub Pages / Vercel). También podés tocar "Foto" al lado.'
+        'Para cámara continua usá HTTPS (GitHub Pages). También podés tocar "Foto" al lado.'
       );
     }
   };
 
+  const callVisionWithModel = async (
+    modelId: string,
+    cleanKey: string,
+    base64JpegClean: string
+  ): Promise<Response> => {
+    return fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(
+        cleanKey
+      )}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: PREFLOP_VISION_PROMPT }] },
+          contents: [
+            {
+              parts: [
+                { text: 'Extraé el estado preflop exacto en JSON.' },
+                { inlineData: { mimeType: 'image/jpeg', data: base64JpegClean } }
+              ]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.0,
+            responseMimeType: 'application/json'
+          }
+        })
+      }
+    );
+  };
+
   const scanBase64Image = async (base64JpegClean: string) => {
-    if (!apiKey.trim()) {
+    const cleanKey = sanitizeApiKey(apiKey);
+    if (!cleanKey) {
       setShowKeyModal(true);
       setErrorMsg('Pegá primero tu API Key gratuita de Google AI Studio en el ícono de llave.');
       return;
@@ -341,41 +442,66 @@ export default function App() {
     const t0 = performance.now();
 
     try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(
-          apiKey.trim()
-        )}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: PREFLOP_VISION_PROMPT }] },
-            contents: [
-              {
-                parts: [
-                  { text: 'Extraé el estado preflop exacto en JSON.' },
-                  { inlineData: { mimeType: 'image/jpeg', data: base64JpegClean } }
-                ]
-              }
-            ],
-            generationConfig: {
-              temperature: 0.0,
-              responseMimeType: 'application/json',
-              thinkingConfig: { thinkingBudget: 0 }
-            }
-          })
-        }
-      );
+      const queue = resolvedModel
+        ? [resolvedModel, ...CANDIDATE_VISION_MODELS.filter((m) => m !== resolvedModel)]
+        : [...CANDIDATE_VISION_MODELS];
 
-      if (!res.ok) {
-        throw new Error(`Error HTTP ${res.status}: revisá la clave API.`);
+      let successResponse: Response | null = null;
+      let activeModelUsed = '';
+      let lastErrorDetail = '';
+
+      for (const candidate of queue) {
+        const res = await callVisionWithModel(candidate, cleanKey, base64JpegClean);
+        if (res.ok) {
+          successResponse = res;
+          activeModelUsed = candidate;
+          break;
+        }
+
+        const errJson = await res.json().catch(() => null);
+        lastErrorDetail = errJson?.error?.message || `HTTP ${res.status}`;
+
+        // Si es 400 API_KEY_INVALID o 403 PERMISSION_DENIED, no tiene sentido probar más modelos
+        if (res.status === 400 || res.status === 403) {
+          if (lastErrorDetail.toLowerCase().includes('key')) {
+            throw new Error(`Clave inválida o bloqueada (${lastErrorDetail}). Creá una nueva en aistudio.google.com/api-keys`);
+          }
+        }
+
+        // Si dio 404, continuar al siguiente modelo candidato
+        if (res.status !== 404) {
+          break;
+        }
       }
 
-      const payload = await res.json();
+      // Si todos los nombres estándar dieron 404, consultar /v1beta/models en vivo para esa API Key
+      if (!successResponse) {
+        const discovered = await discoverAvailableFlashModel(cleanKey);
+        if (discovered) {
+          const retryRes = await callVisionWithModel(discovered, cleanKey, base64JpegClean);
+          if (retryRes.ok) {
+            successResponse = retryRes;
+            activeModelUsed = discovered;
+          } else {
+            const retryErr = await retryRes.json().catch(() => null);
+            lastErrorDetail = retryErr?.error?.message || `HTTP ${retryRes.status}`;
+          }
+        }
+      }
+
+      if (!successResponse) {
+        throw new Error(
+          `No se pudo conectar al modelo (${lastErrorDetail}). Creá una clave nueva con "Create API key in new project" en AI Studio.`
+        );
+      }
+
+      setResolvedModel(activeModelUsed);
+
+      const payload = await successResponse.json();
       const rawText = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!rawText) throw new Error('Lectura vacía: acercá el encuadre al monitor.');
 
-      const parsed = JSON.parse(rawText) as Partial<PreflopState>;
+      const parsed = JSON.parse(extractFirstJsonObject(rawText)) as Partial<PreflopState>;
       const r1 = normalizeRank(parsed.heroRank1 || 'A');
       const r2 = normalizeRank(parsed.heroRank2 || 'K');
 
@@ -597,7 +723,9 @@ export default function App() {
           <div>
             <div className="text-xs font-black tracking-wider text-white">GG PREFLOP SHIELD</div>
             <div className="text-[10px] text-slate-400">
-              {latencyMs ? `Lectura: ${(latencyMs / 1000).toFixed(2)}s` : `Banca: ${formatUsdFromCents(currentRollCents)}`}
+              {latencyMs
+                ? `${(latencyMs / 1000).toFixed(2)}s (${resolvedModel || 'Auto'})`
+                : `Banca: ${formatUsdFromCents(currentRollCents)}`}
             </div>
           </div>
         </div>
@@ -631,12 +759,15 @@ export default function App() {
           <input
             type="password"
             value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
+            onChange={(e) => {
+              setApiKey(e.target.value);
+              setResolvedModel('');
+            }}
             placeholder="AIzaSy..."
             className="w-full bg-black border border-slate-700 rounded-lg px-3 py-2 text-xs text-white font-mono"
           />
           <div className="flex justify-between items-center text-[11px] text-slate-400">
-            <span>Guardada localmente en tu celular.</span>
+            <span>Auto-detecta el modelo Flash activo.</span>
             <button
               onClick={() => setShowKeyModal(false)}
               className="px-3 py-1 rounded-md bg-emerald-600 text-white font-bold"
