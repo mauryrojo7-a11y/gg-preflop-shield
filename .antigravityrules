@@ -1,0 +1,5 @@
+# Reglas Operativas — GG Preflop Shield
+1. Aplicación 100% estática client-side para estudio y resolución preflop en Hyper-Turbo 8-Max.
+2. Prohibido incluir librerías de captura de escritorio, automatización de mouse/teclado o procesos locales.
+3. Toda la aritmética de banca opera en centavos enteros con `BigInt` (`ES2022`).
+4. El modelo `gemini-2.5-flash` solo extrae JSON óptico; el cálculo de Pot Odds, ICM y matrices corre localmente en TypeScript.
